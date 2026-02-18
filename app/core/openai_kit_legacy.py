@@ -36,6 +36,7 @@ def _safe_json_loads(s: str) -> Dict[str, Any]:
     raw = (s or "").strip()
     if not raw:
         return {}
+
     # 1) direct parse
     try:
         return json.loads(raw)
@@ -65,7 +66,7 @@ def _repair_json_with_openai_legacy(
 
     system = (
         "You are a strict JSON formatter. "
-        "You must output ONLY valid JSON with double quotes. "
+        "Output ONLY valid JSON with double quotes. "
         "No markdown. No commentary. No extra keys beyond the schema."
     )
 
@@ -78,6 +79,7 @@ def _repair_json_with_openai_legacy(
             "Use double quotes for all strings",
             "No trailing commas",
             "Ensure all required keys exist",
+            "If a field is unknown, return an empty string or empty list (as appropriate)",
         ],
     }
 
@@ -117,6 +119,8 @@ def generate_application_kit_legacy(
       - gaps
       - risk_flags
       - one_line_pitch
+      - raw_model_text (debug)
+      - raw (parsed json)
     """
     try:
         import openai
@@ -126,6 +130,7 @@ def generate_application_kit_legacy(
     if api_key:
         openai.api_key = api_key
 
+    # Keep payload bounded (helps cost + formatting)
     resume_text = (resume_text or "")[:6500]
     job_desc = (job.get("description") or "")[:2200]
 
@@ -166,6 +171,7 @@ def generate_application_kit_legacy(
             "Emails/DMs must be short, direct, and professional.",
             "Use the job’s keywords only if they truly apply to the candidate.",
             "Return ONLY JSON. No backticks. No markdown.",
+            "All keys in output_contract must be present.",
         ],
         "candidate_profile": candidate_profile,
         "resume_text": resume_text,
@@ -211,15 +217,16 @@ def generate_application_kit_legacy(
     )
 
     content = resp["choices"][0]["message"]["content"] if resp and resp.get("choices") else "{}"
+    raw_model_text = content or ""
 
     # Parse with repair fallback
     try:
-        data = _safe_json_loads(content)
+        data = _safe_json_loads(raw_model_text)
     except Exception:
         if not api_key:
             raise
         data = _repair_json_with_openai_legacy(
-            bad_text=content,
+            bad_text=raw_model_text,
             api_key=api_key,
             model=model,
             expected_schema=expected_schema,
@@ -236,6 +243,7 @@ def generate_application_kit_legacy(
         "gaps": data.get("gaps", []) or [],
         "risk_flags": data.get("risk_flags", []) or [],
         "one_line_pitch": (data.get("one_line_pitch", "") or "").strip(),
+        "raw_model_text": raw_model_text,
         "raw": data,
     }
     return out
