@@ -224,6 +224,10 @@ if enable_openai:
     # Always write raw model output for debugging/audit
     (kit_dir / "openai_raw_output.txt").write_text(kit.get("raw_model_text", ""), encoding="utf-8")
 
+    # PATCH: save repair + fill outputs (if any) for audit/debug
+    (kit_dir / "openai_repair_output.txt").write_text(kit.get("raw_repair_text", ""), encoding="utf-8")
+    (kit_dir / "openai_fill_output.txt").write_text(kit.get("raw_fill_text", ""), encoding="utf-8")
+
     # Write outputs (may be empty; UI will show file sizes + warnings)
     (kit_dir / "match_report.md").write_text(kit.get("match_report_md", ""), encoding="utf-8")
     (kit_dir / "resume_tweak_suggestions.md").write_text(kit.get("resume_tweak_suggestions_md", ""), encoding="utf-8")
@@ -236,6 +240,9 @@ if enable_openai:
         "recruiter_email_txt": "recruiter_email.txt",
         "linkedin_dm_txt": "linkedin_dm.txt",
         "openai_raw_output_txt": "openai_raw_output.txt",
+        # PATCH: include repair + fill files
+        "openai_repair_output_txt": "openai_repair_output.txt",
+        "openai_fill_output_txt": "openai_fill_output.txt",
     }
     manifest["kit_metadata"] = {
         "one_line_pitch": kit.get("one_line_pitch"),
@@ -247,6 +254,10 @@ if enable_openai:
 else:
     # OpenAI disabled stubs (still produce non-empty content)
     (kit_dir / "openai_raw_output.txt").write_text("", encoding="utf-8")
+    # PATCH: also create these files so debug panel is consistent
+    (kit_dir / "openai_repair_output.txt").write_text("", encoding="utf-8")
+    (kit_dir / "openai_fill_output.txt").write_text("", encoding="utf-8")
+
     (kit_dir / "match_report.md").write_text("# Match Report\n(OpenAI disabled)\n", encoding="utf-8")
     (kit_dir / "resume_tweak_suggestions.md").write_text("# Resume Tweaks\n(OpenAI disabled)\n", encoding="utf-8")
     (kit_dir / "recruiter_email.txt").write_text("Hi,\n\n(OpenAI disabled)\n", encoding="utf-8")
@@ -257,6 +268,9 @@ else:
         "recruiter_email_txt": "recruiter_email.txt",
         "linkedin_dm_txt": "linkedin_dm.txt",
         "openai_raw_output_txt": "openai_raw_output.txt",
+        # PATCH
+        "openai_repair_output_txt": "openai_repair_output.txt",
+        "openai_fill_output_txt": "openai_fill_output.txt",
     }
 
 # Save manifest
@@ -276,9 +290,11 @@ email_p = kit_dir / "recruiter_email.txt"
 dm_p = kit_dir / "linkedin_dm.txt"
 manifest_p = kit_dir / "manifest.json"
 raw_p = kit_dir / "openai_raw_output.txt"
+repair_p = kit_dir / "openai_repair_output.txt"
+fill_p = kit_dir / "openai_fill_output.txt"
 
 st.markdown("**Files written:**")
-files = [match_p, tweaks_p, email_p, dm_p, manifest_p, raw_p]
+files = [match_p, tweaks_p, email_p, dm_p, manifest_p, raw_p, repair_p, fill_p]
 for p in files:
     if p.exists():
         st.write(f"- `{p.name}` ({p.stat().st_size} bytes)")
@@ -343,3 +359,11 @@ with tabs[5]:
     raw_txt = _read_file_safe(raw_p).strip()
     st.markdown("**Raw OpenAI output (first 1500 chars):**")
     st.code(raw_txt[:1500] if raw_txt else "<EMPTY>", language="text")
+
+    repair_txt = _read_file_safe(repair_p).strip()
+    st.markdown("**OpenAI repair output (first 1500 chars):**")
+    st.code(repair_txt[:1500] if repair_txt else "<EMPTY>", language="text")
+
+    fill_txt = _read_file_safe(fill_p).strip()
+    st.markdown("**OpenAI fill output (first 1500 chars):**")
+    st.code(fill_txt[:1500] if fill_txt else "<EMPTY>", language="text")
