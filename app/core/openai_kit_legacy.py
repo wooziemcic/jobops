@@ -13,6 +13,31 @@ REQUIRED_TEXT_FIELDS = [
     "linkedin_dm_txt",
 ]
 
+# Heuristics to detect "the model repeated instructions instead of generating content"
+INSTRUCTION_PATTERNS = [
+    r"\binclude top\b",
+    r"\btop\s*5\b",
+    r"\bbefore[-\s]*after\b",
+    r"\b6[-\s]*10 lines\b",
+    r"\b2[-\s]*4 lines\b",
+    r"\bkeep it concise\b",
+    r"\bask for a quick chat\b",
+    r"\bfor maximum impact\b",
+    r"\buse the job\b",
+    r"\bmust be\b",
+    r"\byou should\b",
+    r"\bwrite\b\s+\d",
+    r"\breturn only\b",
+]
+
+# Minimum lengths so we don't accept "one sentence"
+MIN_LEN = {
+    "match_report_md": 400,
+    "resume_tweak_suggestions_md": 400,
+    "recruiter_email_txt": 250,
+    "linkedin_dm_txt": 120,
+}
+
 
 def _extract_json_object(text: str) -> str:
     s = (text or "").strip()
@@ -106,19 +131,55 @@ def _repair_json_with_openai_legacy(
         system=system,
         user_obj=user_obj,
         temperature=0.0,
-        max_tokens=2400,
+        max_tokens=2600,
     )
 
     return _safe_json_loads(repaired_text), repaired_text
 
 
-def _missing_required_text_fields(data: Dict[str, Any]) -> list[str]:
+def _looks_like_instructions(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    for pat in INSTRUCTION_PATTERNS:
+        if re.search(pat, t):
+            return True
+    return False
+
+
+def _missing_or_bad_fields(data: Dict[str, Any], expected_keys: list[str]) -> list[str]:
+    """
+    Return list of fields that are missing OR too short OR look like instructions.
+    Only applies strict checks to the 4 main text fields.
+    """
     missing = []
+
+    # Ensure all expected keys exist
+    for k in expected_keys:
+        if k not in data:
+            missing.append(k)
+
+    # Validate required text fields
     for k in REQUIRED_TEXT_FIELDS:
         v = data.get(k, "")
         if not isinstance(v, str) or not v.strip():
             missing.append(k)
-    return missing
+            continue
+        if _looks_like_instructions(v):
+            missing.append(k)
+            continue
+        if len(v.strip()) < MIN_LEN.get(k, 0):
+            missing.append(k)
+            continue
+
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for k in missing:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
 
 
 def _fill_missing_fields(
@@ -133,43 +194,58 @@ def _fill_missing_fields(
     job: Dict[str, Any],
     ranking_signals: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], str]:
-    """
-    Second pass only for empty required fields. Returns updated data + raw text.
-    """
     system = (
         "You are a strict JSON generator. "
         "Return ONLY valid JSON. No markdown. No extra keys. "
-        "You must fill the requested fields with non-empty content."
+        "You must fill the requested fields with REAL content (not instructions). "
+        "Do NOT describe what you will do; DO the writing."
     )
 
     user_obj = {
-        "task": "Fill the missing fields in an application kit JSON.",
+        "task": "Fill missing/invalid fields in an application kit JSON with real final text.",
         "missing_fields_to_fill": missing_keys,
         "schema": expected_schema,
         "existing_json": base_data,
         "rules": [
             "Do not invent experience not present in resume/profile.",
             "Be specific and job-tailored.",
-            "All requested fields must be NON-EMPTY strings.",
-            "Return ONLY JSON object with the same keys as schema.",
+            "For the 4 main fields, produce real final copy, not guidelines.",
+            "Use concrete proof points from resume/profile.",
+            "Return ONLY JSON object with exactly the schema keys.",
         ],
+        "hard_minimum_lengths": MIN_LEN,
         "context": {
             "candidate_profile": candidate_profile,
-            "resume_text": (resume_text or "")[:5500],
+            "resume_text": (resume_text or "")[:6000],
             "job": {
                 "title": job.get("title") or "",
                 "company": job.get("company") or "",
                 "location": job.get("location") or "",
                 "apply_url": job.get("apply_url") or "",
-                "description": (job.get("description") or "")[:2000],
+                "description": (job.get("description") or "")[:2200],
             },
             "ranking_signals": ranking_signals,
         },
-        "writing_guidance": {
-            "recruiter_email_txt": "6–10 lines, professional, ask for quick chat, 1–2 resume proof points.",
-            "linkedin_dm_txt": "2–4 lines, very short, friendly, direct.",
-            "resume_tweak_suggestions_md": "Top 5 bullets + 3 before→after rewrites.",
-            "match_report_md": "Concise but concrete; include evidence bullets.",
+        "output_formatting": {
+            "match_report_md": {
+                "must_include_sections": [
+                    "Role summary",
+                    "Why you fit",
+                    "Evidence from resume",
+                    "Gaps & mitigations",
+                    "Interview angles",
+                ],
+                "bullet_style": "Use bullets where appropriate, include tools/projects/metrics.",
+            },
+            "resume_tweak_suggestions_md": {
+                "must_include": [
+                    "Top 5 changes",
+                    "Keyword alignment",
+                    "Impact rewrites (before → after) x3",
+                ]
+            },
+            "recruiter_email_txt": "Write the final email (no placeholders), 8–12 lines, specific to role/company.",
+            "linkedin_dm_txt": "Write the final DM (no placeholders), 3–5 lines, specific to role/company.",
         },
     }
 
@@ -179,7 +255,7 @@ def _fill_missing_fields(
         system=system,
         user_obj=user_obj,
         temperature=0.0,
-        max_tokens=2400,
+        max_tokens=2600,
     )
 
     fixed = _safe_json_loads(text)
@@ -196,12 +272,6 @@ def generate_application_kit_legacy(
     api_key: Optional[str] = None,
     temperature: float = 0.1,
 ) -> Dict[str, Any]:
-    """
-    Legacy OpenAI (openai==0.28.x) tailored application kit generator with:
-      - strict JSON parsing
-      - JSON repair if needed
-      - required-field validation + regeneration if empty
-    """
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is required for OpenAI kit generation.")
 
@@ -229,6 +299,7 @@ def generate_application_kit_legacy(
         "risk_flags": ["string"],
         "one_line_pitch": "string",
     }
+    expected_keys = list(expected_schema.keys())
 
     ranking_signals = {
         "base_score": base_score,
@@ -237,41 +308,34 @@ def generate_application_kit_legacy(
         "title_hits": title_hits,
     }
 
-    # Step A: generate full kit
     system = (
         "You are a strict JSON generator. "
         "Return ONLY valid JSON (double quotes, no trailing commas). "
         "You MUST include every key in the schema. "
-        "All 4 main text fields must be non-empty strings: "
-        "match_report_md, resume_tweak_suggestions_md, recruiter_email_txt, linkedin_dm_txt."
+        "For the 4 main text fields, write REAL final content (not instructions)."
     )
 
-    # Smaller, clearer instructions improve compliance
     user_obj = {
-        "task": "Generate a job-tailored application kit.",
+        "task": "Generate a job-tailored application kit with real final text.",
         "schema": expected_schema,
         "hard_requirements": [
             "Return ONLY JSON object",
             "Include every schema key",
             "No markdown fences",
-            "The 4 main text fields must be NON-EMPTY strings",
+            "No placeholders or guidelines text",
+            "Main fields must be real content with minimum length constraints",
         ],
+        "hard_minimum_lengths": MIN_LEN,
         "candidate_profile": candidate_profile,
-        "resume_text": resume_text[:5500],
+        "resume_text": resume_text[:6000],
         "job": {
             "title": job.get("title") or "",
             "company": job.get("company") or "",
             "location": job.get("location") or "",
             "apply_url": job.get("apply_url") or "",
-            "description": job_desc[:2000],
+            "description": job_desc[:2200],
         },
         "ranking_signals": ranking_signals,
-        "style": {
-            "one_line_pitch": "One sentence: value + proof + role.",
-            "recruiter_email_txt": "6–10 lines, direct, 1–2 proof points, ask for quick chat.",
-            "linkedin_dm_txt": "2–4 lines, concise.",
-            "resume_tweak_suggestions_md": "Top 5 bullets + 3 before→after rewrites.",
-        },
     }
 
     raw_model_text = _call_openai_legacy(
@@ -280,7 +344,7 @@ def generate_application_kit_legacy(
         system=system,
         user_obj=user_obj,
         temperature=float(temperature),
-        max_tokens=2400,
+        max_tokens=2600,
     )
 
     raw_repair_text = ""
@@ -297,35 +361,27 @@ def generate_application_kit_legacy(
             expected_schema=expected_schema,
         )
 
-    # Validate required fields; if empty, regenerate missing fields only
-    missing = _missing_required_text_fields(data)
+    # Fill missing/bad fields (too short / instruction-like / missing keys)
+    missing = _missing_or_bad_fields(data, expected_keys)
     if missing:
-        try:
-            fixed, raw_fill_text = _fill_missing_fields(
-                api_key=api_key,
-                model=model,
-                expected_schema=expected_schema,
-                base_data=data,
-                missing_keys=missing,
-                candidate_profile=candidate_profile,
-                resume_text=resume_text,
-                job=job,
-                ranking_signals=ranking_signals,
-            )
-            # merge: take fixed values, but keep existing non-empty values
-            for k in expected_schema.keys():
-                if k in REQUIRED_TEXT_FIELDS:
-                    if isinstance(fixed.get(k), str) and fixed.get(k).strip():
-                        data[k] = fixed[k]
-                else:
-                    # for lists/other fields, prefer fixed if present
-                    if fixed.get(k) is not None:
-                        data[k] = fixed[k]
-        except Exception:
-            # If fill fails, we still return what we have (UI will show empties)
-            pass
+        fixed, raw_fill_text = _fill_missing_fields(
+            api_key=api_key,
+            model=model,
+            expected_schema=expected_schema,
+            base_data=data,
+            missing_keys=missing,
+            candidate_profile=candidate_profile,
+            resume_text=resume_text,
+            job=job,
+            ranking_signals=ranking_signals,
+        )
 
-    # Normalize outputs
+        # Merge fixed into data for the keys we asked to fill
+        for k in expected_keys:
+            if k in fixed:
+                data[k] = fixed[k]
+
+    # Final normalization
     out = {
         "match_report_md": (data.get("match_report_md", "") or "").strip(),
         "resume_tweak_suggestions_md": (data.get("resume_tweak_suggestions_md", "") or "").strip(),
