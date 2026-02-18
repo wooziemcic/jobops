@@ -26,6 +26,9 @@ INSTRUCTION_PATTERNS = [
     r"\bno markdown\b",
 ]
 
+# Treat these as "placeholder garbage" (schema echoes)
+PLACEHOLDER_STRINGS = {"string", "String", "STRING"}
+
 MIN_LEN = {
     "match_report_md": 300,
     "resume_tweak_suggestions_md": 300,
@@ -50,47 +53,41 @@ def _light_json_sanitize(s: str) -> str:
         return s
     s = s.replace("“", '"').replace("”", '"').replace("’", "'").replace("‘", "'")
     s = re.sub(r",\s*([}\]])", r"\1", s)  # trailing commas
-    # remove weird null bytes
     s = s.replace("\x00", "")
     return s
 
 
 def _try_json_loads(s: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Returns (obj, error_str). obj is None if parsing fails.
-    """
     try:
-        return json.loads(s), None
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj, None
+        return None, "not_a_dict"
     except Exception as e:
         return None, str(e)
 
 
 def _safe_json_loads_no_throw(s: str) -> Tuple[Dict[str, Any], str]:
-    """
-    Never throws. Returns (parsed_obj_or_empty, debug_reason).
-    """
     raw = (s or "").strip()
     if not raw:
         return {}, "empty_input"
 
-    # 1) direct
     obj, err = _try_json_loads(raw)
-    if obj is not None and isinstance(obj, dict):
+    if obj is not None:
         return obj, "direct_ok"
 
-    # 2) extract braces
     extracted = _extract_json_object(raw)
     extracted = _light_json_sanitize(extracted)
     obj, err2 = _try_json_loads(extracted)
-    if obj is not None and isinstance(obj, dict):
+    if obj is not None:
         return obj, "extracted_ok"
 
-    # 3) final sanitize (sometimes model returns JSON with leading/trailing text)
+    # final trim attempt
     extracted2 = re.sub(r"^[^{]*", "", raw)
     extracted2 = re.sub(r"[^}]*$", "", extracted2)
     extracted2 = _light_json_sanitize(extracted2)
     obj, err3 = _try_json_loads(extracted2)
-    if obj is not None and isinstance(obj, dict):
+    if obj is not None:
         return obj, "trimmed_ok"
 
     return {}, f"parse_failed: direct={err} extracted={err2} trimmed={err3}"
@@ -122,37 +119,62 @@ def _call_openai_legacy(
 
 
 def _looks_like_instructions(text: str) -> bool:
-    t = (text or "").strip().lower()
+    t = (text or "").strip()
     if not t:
         return True
+    if t in PLACEHOLDER_STRINGS:
+        return True
+    tl = t.lower()
     for pat in INSTRUCTION_PATTERNS:
-        if re.search(pat, t):
+        if re.search(pat, tl):
             return True
     return False
+
+
+def _is_list_placeholder(v: Any) -> bool:
+    # common schema echo: ["string"]
+    return isinstance(v, list) and len(v) == 1 and isinstance(v[0], str) and v[0] in PLACEHOLDER_STRINGS
+
+
+def _ensure_schema_defaults(expected_keys: list[str], data: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(data) if isinstance(data, dict) else {}
+    for k in expected_keys:
+        if k not in out:
+            if k in ("keywords_to_emphasize", "must_have_hits", "gaps", "risk_flags"):
+                out[k] = []
+            else:
+                out[k] = ""  # NEVER "string"
+    return out
 
 
 def _missing_or_bad_fields(data: Dict[str, Any], expected_keys: list[str]) -> list[str]:
     missing = []
 
-    # Ensure all expected keys exist
+    # Missing keys
     for k in expected_keys:
         if k not in data:
             missing.append(k)
 
-    # Validate main text fields
+    # Main text fields must be real content
     for k in REQUIRED_TEXT_FIELDS:
         v = data.get(k, "")
         if not isinstance(v, str) or not v.strip():
             missing.append(k)
             continue
-        if _looks_like_instructions(v):
+        if _looks_like_instructions(v.strip()):
             missing.append(k)
             continue
         if len(v.strip()) < MIN_LEN.get(k, 0):
             missing.append(k)
             continue
 
-    # Deduplicate keep order
+    # List fields must not be ["string"]
+    for k in ("keywords_to_emphasize", "must_have_hits", "gaps", "risk_flags"):
+        v = data.get(k, [])
+        if _is_list_placeholder(v):
+            missing.append(k)
+
+    # Dedup keep order
     seen = set()
     out = []
     for k in missing:
@@ -162,17 +184,13 @@ def _missing_or_bad_fields(data: Dict[str, Any], expected_keys: list[str]) -> li
     return out
 
 
-def _strict_json_only_pass(
+def _repair_json_with_openai_legacy(
     *,
+    bad_text: str,
     api_key: str,
     model: str,
     expected_schema: Dict[str, Any],
-    text_to_convert: str,
 ) -> Tuple[Dict[str, Any], str, str]:
-    """
-    Final fallback: ask the model to output STRICT JSON only from arbitrary text.
-    Never throws. Returns (parsed, raw_text, parse_debug).
-    """
     system = (
         "You are a strict JSON formatter. "
         "Return ONLY a JSON object. "
@@ -181,51 +199,9 @@ def _strict_json_only_pass(
         "Include every key in the schema."
     )
     user_obj = {
-        "task": "Convert the provided text into valid JSON that matches the schema exactly.",
+        "task": "Repair/convert the provided output into valid JSON matching the schema exactly.",
         "schema": expected_schema,
-        "text": text_to_convert,
-    }
-
-    raw = _call_openai_legacy(
-        api_key=api_key,
-        model=model,
-        system=system,
-        user_obj=user_obj,
-        temperature=0.0,
-        max_tokens=2600,
-    )
-    parsed, dbg = _safe_json_loads_no_throw(raw)
-    return parsed, raw, dbg
-
-
-def _repair_json_with_openai_legacy(
-    *,
-    bad_text: str,
-    api_key: str,
-    model: str,
-    expected_schema: Dict[str, Any],
-) -> Tuple[Dict[str, Any], str, str]:
-    """
-    Tries to repair bad JSON. Never throws.
-    Returns (parsed_or_empty, raw_repair_text, parse_debug_reason)
-    """
-    system = (
-        "You are a strict JSON formatter. "
-        "Output ONLY valid JSON with double quotes. "
-        "No markdown. No commentary. "
-        "You MUST include every key in the schema."
-    )
-
-    user_obj = {
-        "task": "Repair invalid JSON into valid JSON that matches the schema exactly.",
-        "schema": expected_schema,
-        "invalid_output": bad_text,
-        "requirements": [
-            "Return ONLY a JSON object",
-            "Use double quotes for all strings",
-            "No trailing commas",
-            "Ensure all required keys exist",
-        ],
+        "text": bad_text,
     }
 
     repaired_text = _call_openai_legacy(
@@ -234,9 +210,8 @@ def _repair_json_with_openai_legacy(
         system=system,
         user_obj=user_obj,
         temperature=0.0,
-        max_tokens=2600,
+        max_tokens=2800,
     )
-
     parsed, dbg = _safe_json_loads_no_throw(repaired_text)
     return parsed, repaired_text, dbg
 
@@ -256,8 +231,8 @@ def _fill_missing_fields(
     system = (
         "You are a strict JSON generator. "
         "Return ONLY valid JSON. No markdown. No extra keys. "
-        "Write REAL final content, not guidelines. "
-        "Do NOT describe what you will do; DO the writing."
+        "Write REAL final content (not guidelines). "
+        "Do NOT output type placeholders like 'string'."
     )
 
     user_obj = {
@@ -269,7 +244,7 @@ def _fill_missing_fields(
         "rules": [
             "Do not invent experience not present in resume/profile.",
             "Be specific and job-tailored.",
-            "Main text fields must be real copy, not placeholders.",
+            "Main text fields must be real copy (no placeholders, no instructions).",
             "Return ONLY JSON with exactly the schema keys.",
         ],
         "context": {
@@ -280,9 +255,15 @@ def _fill_missing_fields(
                 "company": job.get("company") or "",
                 "location": job.get("location") or "",
                 "apply_url": job.get("apply_url") or "",
-                "description": (job.get("description") or "")[:2200],
+                "description": (job.get("description") or "")[:2400],
             },
             "ranking_signals": ranking_signals,
+        },
+        "required_outputs": {
+            "match_report_md": "Must include headings and evidence bullets with tools/projects/metrics.",
+            "resume_tweak_suggestions_md": "Top 5 changes + keywords + 3 before→after rewrites.",
+            "recruiter_email_txt": "Final email (8–12 lines), specific to role/company, 1–2 proof points.",
+            "linkedin_dm_txt": "Final DM (3–5 lines), specific to role/company.",
         },
     }
 
@@ -292,26 +273,11 @@ def _fill_missing_fields(
         system=system,
         user_obj=user_obj,
         temperature=0.0,
-        max_tokens=2600,
+        max_tokens=2800,
     )
 
     parsed, dbg = _safe_json_loads_no_throw(text)
     return parsed, text, dbg
-
-
-def _ensure_schema_defaults(expected_keys: list[str], data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Make sure all expected keys exist with safe defaults.
-    """
-    out = dict(data) if isinstance(data, dict) else {}
-    for k in expected_keys:
-        if k not in out:
-            # default by type guess
-            if k in ("keywords_to_emphasize", "must_have_hits", "gaps", "risk_flags"):
-                out[k] = []
-            else:
-                out[k] = ""
-    return out
 
 
 def generate_application_kit_legacy(
@@ -328,7 +294,6 @@ def generate_application_kit_legacy(
         raise RuntimeError("OPENAI_API_KEY is required for OpenAI kit generation.")
 
     resume_text = (resume_text or "")[:6500]
-    job_desc = (job.get("description") or "")[:2200]
 
     base_score = None
     breakdown = {}
@@ -360,12 +325,11 @@ def generate_application_kit_legacy(
         "title_hits": title_hits,
     }
 
-    # Step A: initial generation
+    # Step A: initial gen
     system = (
         "You are a strict JSON generator. Return ONLY valid JSON. "
         "Include every schema key. No markdown. "
-        "Write REAL final content, not guidelines. "
-        "Main text fields must be substantive."
+        "Write REAL final content (not placeholders)."
     )
 
     user_obj = {
@@ -379,7 +343,7 @@ def generate_application_kit_legacy(
             "company": job.get("company") or "",
             "location": job.get("location") or "",
             "apply_url": job.get("apply_url") or "",
-            "description": job_desc[:2200],
+            "description": (job.get("description") or "")[:2400],
         },
         "ranking_signals": ranking_signals,
     }
@@ -390,42 +354,35 @@ def generate_application_kit_legacy(
         system=system,
         user_obj=user_obj,
         temperature=float(temperature),
-        max_tokens=2600,
+        max_tokens=2800,
     )
 
     raw_repair_text = ""
     raw_fill_text = ""
-    raw_strict_text = ""
-    parse_debug = "none"
+    parse_debug = ""
     repair_parse_debug = ""
     fill_parse_debug = ""
-    strict_parse_debug = ""
 
     data, parse_debug = _safe_json_loads_no_throw(raw_model_text)
 
-    # If initial parse fails or returns empty, attempt repair
-    if not data:
-        data, raw_repair_text, repair_parse_debug = _repair_json_with_openai_legacy(
+    # If parse failed OR looks like schema echo (e.g., returns {"match_report_md":"string",...})
+    data = _ensure_schema_defaults(expected_keys, data)
+
+    missing = _missing_or_bad_fields(data, expected_keys)
+
+    # If badly formed output, attempt repair first
+    if missing and (parse_debug.startswith("parse_failed") or any(data.get(k, "").strip() in PLACEHOLDER_STRINGS for k in REQUIRED_TEXT_FIELDS)):
+        repaired, raw_repair_text, repair_parse_debug = _repair_json_with_openai_legacy(
             bad_text=raw_model_text,
             api_key=api_key,
             model=model,
             expected_schema=expected_schema,
         )
+        repaired = _ensure_schema_defaults(expected_keys, repaired)
+        data = repaired
+        missing = _missing_or_bad_fields(data, expected_keys)
 
-        # If repair still fails, strict-json-only pass
-        if not data:
-            data, raw_strict_text, strict_parse_debug = _strict_json_only_pass(
-                api_key=api_key,
-                model=model,
-                expected_schema=expected_schema,
-                text_to_convert=raw_repair_text or raw_model_text,
-            )
-
-    # Ensure schema defaults so downstream doesn't KeyError
-    data = _ensure_schema_defaults(expected_keys, data)
-
-    # Fill missing/bad fields (too short / placeholder / missing keys)
-    missing = _missing_or_bad_fields(data, expected_keys)
+    # Fill pass (the main fix)
     if missing:
         fixed, raw_fill_text, fill_parse_debug = _fill_missing_fields(
             api_key=api_key,
@@ -438,17 +395,21 @@ def generate_application_kit_legacy(
             job=job,
             ranking_signals=ranking_signals,
         )
-
+        fixed = _ensure_schema_defaults(expected_keys, fixed)
         if fixed:
-            fixed = _ensure_schema_defaults(expected_keys, fixed)
             for k in expected_keys:
                 data[k] = fixed.get(k, data.get(k))
 
-    # Final guarantee: never crash; if still bad, provide safe stubs
+    # Final: if still garbage, replace with explicit error stubs (never "string")
     for k in REQUIRED_TEXT_FIELDS:
         v = data.get(k, "")
-        if not isinstance(v, str) or not v.strip() or _looks_like_instructions(v):
-            data[k] = f"(Generation failed for {k}. See openai_raw_output.txt / openai_fill_output.txt.)"
+        if not isinstance(v, str) or not v.strip() or _looks_like_instructions(v.strip()):
+            data[k] = f"(Generation failed for {k}. See openai_raw_output.txt / openai_repair_output.txt / openai_fill_output.txt.)"
+
+    # Lists: if schema echo, empty them
+    for k in ("keywords_to_emphasize", "must_have_hits", "gaps", "risk_flags"):
+        if _is_list_placeholder(data.get(k)):
+            data[k] = []
 
     out = {
         "match_report_md": (data.get("match_report_md", "") or "").strip(),
@@ -463,12 +424,9 @@ def generate_application_kit_legacy(
         "raw_model_text": raw_model_text or "",
         "raw_repair_text": raw_repair_text or "",
         "raw_fill_text": raw_fill_text or "",
-        # extra debug (optional)
-        "raw_strict_text": raw_strict_text or "",
         "parse_debug": parse_debug,
         "repair_parse_debug": repair_parse_debug,
         "fill_parse_debug": fill_parse_debug,
-        "strict_parse_debug": strict_parse_debug,
         "raw": data,
     }
     return out
